@@ -64,6 +64,7 @@ export class IngestionWorker {
   private _cwd: string;
   private _debounceMs: number;
   private _onStatusChange?: (store: string, status: string, detail?: string) => void;
+  private _conversationContext: string = "";
 
   constructor(
     stores: Map<
@@ -84,6 +85,13 @@ export class IngestionWorker {
     this._cwd = cwd;
     this._debounceMs = debounceMs;
     this._onStatusChange = onStatusChange;
+  }
+
+  /**
+   * Set recent conversation context to include in the next ingestion.
+   */
+  setConversationContext(context: string): void {
+    this._conversationContext = context;
   }
 
   get isRunning(): boolean {
@@ -145,15 +153,17 @@ export class IngestionWorker {
       const fileTree = getProjectTree(this._cwd, config.exclude);
       this._onStatusChange?.(storeName, "ingesting", `Found ${files.length} project files`);
 
-      // 2. Read existing memory
-      const existingMemory = new Map<string, string>();
+      // 2. Build memory file listing (names + first heading only — not full content)
+      const memoryListing = new Map<string, string>();
       for (const relPath of store.listRelativeFiles()) {
         const content = store.readFile(relPath);
         if (content !== null) {
-          existingMemory.set(relPath, content);
+          // Extract the first heading or first line as a summary
+          const firstLine = content.split("\n").find((l) => l.startsWith("#")) ?? relPath;
+          memoryListing.set(relPath, firstLine);
         }
       }
-      this._onStatusChange?.(storeName, "ingesting", `${existingMemory.size} memory files loaded`);
+      this._onStatusChange?.(storeName, "ingesting", `${memoryListing.size} memory files listed`);
 
       // 3. Call ingestion LLM
       const llm = this._getLlmContext();
@@ -163,7 +173,8 @@ export class IngestionWorker {
         projectRoot: this._cwd,
         fileTree,
         keyFiles,
-        existingMemory,
+        memoryListing,
+        conversationContext: this._conversationContext,
         recentChanges: "",
         includePatterns: config.include,
         excludePatterns: config.exclude,
@@ -204,7 +215,7 @@ export class IngestionWorker {
       // 7. Update metadata
       store.setLastIngestedAt(new Date().toISOString());
 
-      this._onStatusChange?.(storeName, "complete", `${changedFiles.length} files, ${existingMemory.size + changedFiles.length} total memory files`);
+      this._onStatusChange?.(storeName, "complete", `${changedFiles.length} files, ${memoryListing.size + changedFiles.length} total memory files`);
     } finally {
       this._isRunning = false;
 

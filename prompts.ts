@@ -1,26 +1,27 @@
 /**
  * Prompts for the ingestion LLM.
  *
- * The ingestion LLM reads project state and existing memory,
- * then produces updated markdown files.
+ * The ingestion LLM receives:
+ * - Project file tree and key source files
+ * - A listing of existing memory files (names + headings only — not full content)
+ * - Recent conversation context (what was discussed)
+ * - Recent file changes
+ *
+ * It produces updated markdown files as structured JSON.
  */
 
 export interface IngestionParams {
-  /** Name of the store being ingested */
   storeName: string;
-  /** Project root directory path */
   projectRoot: string;
-  /** Text representation of the project file tree */
   fileTree: string;
-  /** Key files discovered (path -> content) */
   keyFiles: Map<string, string>;
-  /** Existing memory files (path -> content) */
-  existingMemory: Map<string, string>;
-  /** Recent changes summary (e.g. files that were edited) */
+  /** Memory file listing: path -> first heading / summary */
+  memoryListing: Map<string, string>;
+  /** Recent conversation messages (last N user/assistant exchanges) */
+  conversationContext: string;
+  /** Summary of files that were changed */
   recentChanges: string;
-  /** File include patterns */
   includePatterns: string[];
-  /** File exclude patterns */
   excludePatterns: string[];
 }
 
@@ -34,6 +35,13 @@ export function buildIngestionSystemPrompt(): string {
 
 Update the memory files to reflect the current state of the project. The memory files help a coding assistant understand the project architecture, key modules, data flow, and decisions.
 
+## How to Work
+
+1. You will receive a listing of existing memory files (names + section headings). This tells you what's already documented.
+2. You will receive recent conversation context — this tells you what was discussed and decided.
+3. You will receive the project file tree and key source files.
+4. Based on all this, decide which memory files need updating and produce the new content.
+
 ## Guidelines
 
 1. Write clear, concise markdown
@@ -43,6 +51,7 @@ Update the memory files to reflect the current state of the project. The memory 
 5. If nothing has changed, respond with an empty files object
 6. Never delete memory files unless the corresponding code no longer exists
 7. Preserve information that is still accurate even if a file wasn't explicitly reviewed
+8. Use the conversation context to understand WHY changes were made — capture decisions and reasoning
 
 ## Output Format
 
@@ -71,7 +80,7 @@ export function buildIngestionUserPrompt(params: IngestionParams): string {
   sections.push(`## Project Root\n\n${params.projectRoot}`);
   sections.push(`## Project File Tree\n\n\`\`\`\n${params.fileTree}\n\`\`\``);
 
-  // Key files
+  // Key source files (limited to most important ones)
   if (params.keyFiles.size > 0) {
     const keyFileEntries: string[] = [];
     for (const [path, content] of params.keyFiles) {
@@ -80,21 +89,26 @@ export function buildIngestionUserPrompt(params: IngestionParams): string {
     sections.push(`## Key Source Files\n\n${keyFileEntries.join("\n\n")}`);
   }
 
-  // Existing memory
-  if (params.existingMemory.size > 0) {
-    const memoryEntries: string[] = [];
-    for (const [path, content] of params.existingMemory) {
-      memoryEntries.push(`### ${path}\n\n${content}`);
+  // Memory file listing (names + headings only, not full content)
+  if (params.memoryListing.size > 0) {
+    const listing: string[] = [];
+    for (const [path, summary] of params.memoryListing) {
+      listing.push(`- \`${path}\`: ${summary.slice(0, 200)}`);
     }
-    sections.push(`## Existing Memory Files\n\n${memoryEntries.join("\n\n")}`);
+    sections.push(`## Existing Memory Files\n\n${listing.join("\n")}\n\n(Only file names and headings shown. Use the headings to decide which files need updating.)`);
+  }
+
+  // Conversation context
+  if (params.conversationContext) {
+    sections.push(`## Recent Conversation\n\n${params.conversationContext}`);
   }
 
   // Recent changes
   if (params.recentChanges) {
-    sections.push(`## Recent Changes\n\n${params.recentChanges}`);
+    sections.push(`## Recent File Changes\n\n${params.recentChanges}`);
   }
 
-  sections.push(`## Task\n\nReview the project state above and update the memory files. Only include files that need changes. If nothing changed, return an empty files object.`);
+  sections.push(`## Task\n\nReview the project state, conversation context, and existing memory above. Update the memory files to reflect the current state. Only include files that need changes. If nothing changed, return an empty files object.`);
 
   return sections.join("\n\n");
 }

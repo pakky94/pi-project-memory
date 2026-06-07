@@ -351,10 +351,38 @@ export default function (pi: ExtensionAPI) {
     toolsRegistered = false;
   });
 
-  pi.on("turn_end", async (event) => {
+  pi.on("turn_end", async (event, ctx) => {
     if (!worker || stores.size === 0) return;
     const tr = event.toolResults ?? [];
     if (!tr.some((t) => t.toolName === "write" || t.toolName === "edit" || t.toolName === "bash")) return;
+
+    // Capture recent conversation context for the ingestion
+    try {
+      const branch = ctx.sessionManager.getBranch();
+      const recentMessages: string[] = [];
+      let count = 0;
+      for (let i = branch.length - 1; i >= 0 && count < 6; i--) {
+        const entry = branch[i];
+        if (entry.type === "message" && entry.message?.role) {
+          const role = entry.message.role;
+          if (role === "user" || role === "assistant") {
+            const textParts = (entry.message.content as any[])
+              ?.filter((c: any) => c.type === "text")
+              .map((c: any) => c.text) ?? [];
+            if (textParts.length > 0) {
+              recentMessages.unshift(`[${role}] ${textParts.join("\n").slice(0, 1000)}`);
+              count++;
+            }
+          }
+        }
+      }
+      if (recentMessages.length > 0) {
+        worker.setConversationContext(recentMessages.join("\n\n"));
+      }
+    } catch {
+      // Best-effort
+    }
+
     ui?.setStatus("memory:pending", `🧠 Changes detected — scheduling ingestion...`);
     for (const [name] of stores) worker.schedule(name);
   });
