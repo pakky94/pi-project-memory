@@ -1,380 +1,346 @@
-# pi-project-memory — Design
+# pi-project-memory Design
 
-**Date:** 2026-06-07
-**Status:** Approved, ready for implementation
-**Target:** A pi extension that maintains a per-project, multi-store semantic memory of the codebase, with auto-update and configurable models.
+## Overview
 
-## 1. Goals & non-goals
+A pi coding agent extension that maintains a persistent, searchable memory of software project structure. The agent automatically updates its understanding of the project as it works, without user intervention. Memory is stored as human-readable markdown files with a sqlite-vec vector index for semantic search.
 
-**Goals**
-- Give the agent durable understanding of the project across sessions, compactions, and `/new`.
-- Auto-update memory as the agent works, without requiring explicit user action.
-- Allow the user to configure multiple memory "stores" per repo (e.g. local project + shared platform).
-- Allow per-store (and per-config-default) selection of the ingestion LLM and the embedding model.
-- Make the on-disk representation human-readable markdown so the user can inspect, edit, and selectively commit it.
-- Use sqlite-vec for fast semantic search; the vector index is derived, not authoritative.
-- Be offline-friendly for the ingestion model (whatever pi has configured) and tolerant of missing embedding config (graceful degradation to keyword/Markdown-only search).
+## Goals
 
-**Non-goals (YAGNI)**
-- Cross-repo memory graph / shared knowledge base across many repos (a single store can live outside the repo, but we don't sync stores).
-- Real-time filesystem watcher (we hook pi events instead — cheaper and more accurate to agent activity).
-- UI for browsing the memory in pi (a TUI widget is tempting but out of scope; `cat` works).
-- A custom vector DB or remote vector service (sqlite-vec only).
-- Auto-commit of memory to git (the user controls git; we just write files).
+- Agent understands project architecture and can answer "where is X?" questions
+- Memory updates automatically as the agent edits files and works on the project
+- Human-readable markdown as the source of truth — no magic binary formats
+- Semantic search via sqlite-vec for fuzzy recall
+- Configurable per-project with support for multiple stores (e.g. local project + cross-repo architecture)
+- Separate configurable LLM models for ingestion and embedding
 
-## 2. High-level architecture
+## Non-goals
+
+- Not a replacement for git — memory is derived from project state, not a version tracker
+- Not a completion engine — memory is for the agent's understanding, not code generation
+- Not a general RAG system — scoped to software project understanding
+- No automatic `.gitignore` management — let the user decide what to commit
+
+## Core Concepts
+
+### Store
+
+A `Store` is a named collection of project memory data. Each store has:
+
+- A **unique name** (e.g. `"project"`, `"platform"`, `"infra"`)
+- A **directory path** where its markdown files live
+- An optional **sqlite-vec database** at `<path>/vec.db` (derived index)
+- **Configurable ingestion** model and embedding endpoint
+- **File patterns** for what to include/exclude when ingesting
+
+Multiple stores let a single repository participate in different memory scopes simultaneously — e.g. a "project" store for the local service and a "platform" store shared across repos describing the larger architecture.
+
+### Memory Config
+
+A JSON file declaring stores and global defaults. Primary location is `memory.config.json` at the project root. Falls back to `.pi/memory.json` if the root file doesn't exist.
+
+### Markdown Memory Files
+
+Each store's directory contains markdown files written by the ingestion LLM. A typical layout:
 
 ```
-                ┌────────────────────────────────────────────────────┐
-                │                   pi session                       │
-                │                                                    │
-   events ───►  │  ┌────────────────────────────────────────────┐    │
-                │  │  pi-project-memory extension               │    │
-                │  │                                            │    │
-                │  │  ┌──────────────┐    ┌──────────────────┐  │    │
-                │  │  │ IngestQueue  │───►│ IngestWorker     │  │    │
-                │  │  │  (debounce)  │    │ (LLM call, write │  │    │
-                │  │  └──────────────┘    │  markdown,       │  │    │
-                │  │       ▲              │  re-embed)       │  │    │
-                │  │       │              └──────────────────┘  │    │
-                │  │       │                     │               │    │
-                │  │  ┌────┴─────────┐   ┌───────▼──────────┐    │    │
-                │  │  │Triggers:     │   │ StoreManager     │    │    │
-                │  │  │ - tool_call  │   │  per-store:      │    │    │
-                │  │  │ - turn_end   │   │   - markdown dir │    │    │
-                │  │  │ - cmd        │   │   - vec.db       │    │    │
-                │  │  └──────────────┘   │   - chunker      │    │    │
-                │  │                     │   - embedder     │    │    │
-                │  │                     └──────────────────┘    │    │
-                │  │                                                │    │
-                │  │  before_agent_start ──► ContextBuilder        │    │
-                │  │  LLM tools ──────────► SearchEngine          │    │
-                │  └────────────────────────────────────────────┘    │
-                │                                                    │
-                │  Ingestion LLM: pi-ai `complete()`                 │
-                │  Embeddings: HTTP (OpenAI-compat) or Ollama        │
-                └────────────────────────────────────────────────────┘
+<store-path>/
+├── vec.db              # sqlite-vec index (auto-generated)
+├── architecture.md     # Overall project structure
+├── modules/
+│   ├── auth.md         # Auth module details
+│   ├── api.md          # API layer details
+│   └── database.md     # Data access layer
+└── decisions.md         # Architectural decisions made
 ```
 
-## 3. On-disk layout
+The markdown files are git-friendly and human-readable. The vector DB is an accelerator derived from them.
 
-Config is loaded from the first of these that exists (relative to repo root):
+## Configuration
 
-1. `./memory.config.json`
-2. `./.pi/memory.json`
+### `memory.config.json` / `.pi/memory.json`
 
-If neither exists, the extension runs in a default mode: a single store named `default` at `./.pi/memory/default/`, with ingestion using the active model and embeddings disabled (keyword search only).
-
-Config schema:
-
-```jsonc
+```json
 {
-  "version": 1,
+  "$schema": "https://example.com/pi-memory-schema.json",
+
   "defaults": {
-    "ingestModel": "anthropic/claude-sonnet-4.5",     // optional, falls back to active model
-    "embedding": {                                    // optional
-      "provider": "openai-compatible",                // or "ollama"
-      "baseUrl": "https://api.openai.com/v1",
-      "apiKey": "${OPENAI_API_KEY}",                  // ${ENV} expansion
-      "model": "text-embedding-3-small",
-      "dimensions": 1536
+    "ingestionModel": "claude-sonnet-4-20250514",
+    "embedding": {
+      "provider": "openai-compatible",
+      "baseUrl": "http://localhost:11434/v1",
+      "model": "nomic-embed-text",
+      "apiKey": "",
+      "dimensions": 768
     },
-    "chunking": { "maxTokens": 600, "overlap": 80 },
-    "ignore": ["node_modules", "dist", ".git", "build", "coverage", ".next", "out"],
-    "maxFileBytes": 200000
+    "include": ["**/*.{ts,tsx,js,jsx,json,md,yaml,yml,toml}"],
+    "exclude": ["**/node_modules/**", "**/dist/**", "**/.git/**"]
   },
+
   "stores": [
     {
       "name": "project",
-      "path": "./.pi/memory/project",
-      "scope": "./",                                   // roots to scan for changes
-      "include": ["**/*.ts", "**/*.md", "package.json", "tsconfig.json"],
-      "ignore": ["**/*.test.ts", "**/__snapshots__/**"],
-      "ingestModel": "anthropic/claude-sonnet-4.5",    // overrides defaults
-      "embedding": { /* ... */ },                      // overrides defaults
-      "chunking": { "maxTokens": 500, "overlap": 80 }
+      "path": "./.pi/memory/project"
     },
     {
       "name": "platform",
-      "path": "/Users/me/.memory/myorg-platform",
-      "scope": "../",                                  // relative to config dir
-      "include": ["**/*.md", "**/*.proto", "**/*.yaml"]
-      // inherits defaults for ingestModel / embedding
+      "path": "/path/to/shared/architecture/memory"
     }
   ]
 }
 ```
 
-Per-store on disk:
+**Fields:**
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `defaults` | object | — | Global defaults applied to all stores |
+| `defaults.ingestionModel` | string | active model | Provider/model ID for ingestion LLM calls |
+| `defaults.embedding` | object | — | Embedding provider config |
+| `defaults.embedding.provider` | string | `"openai-compatible"` | API format: `"openai-compatible"` or `"ollama"` |
+| `defaults.embedding.baseUrl` | string | — | Embedding service URL |
+| `defaults.embedding.model` | string | — | Embedding model name |
+| `defaults.embedding.apiKey` | string | `""` | API key (can also use env var `EMBEDDING_API_KEY`) |
+| `defaults.embedding.dimensions` | number | — | Embedding dimension count |
+| `defaults.include` | string[] | `["**/*.{ts,tsx,js,jsx,json,md,yaml,yml,toml}"]` | Glob patterns for files to include in ingestion |
+| `defaults.exclude` | string[] | `["**/node_modules/**", "**/dist/**", "**/.git/**", "**/.pi/**"]` | Glob patterns to exclude |
+| `defaults.autoinject` | boolean | `true` | Auto-inject relevant memory chunks for substantive prompts |
+| `defaults.debounceMs` | number | `30000` | Debounce window for ingestion after changes (ms) |
+| `stores` | array | `[]` | List of stores |
+| `stores[].name` | string | — | Unique store name (required) |
+| `stores[].path` | string | `./.pi/memory/<name>` | Directory for store markdown files |
+| `stores[].ingestionModel` | string | global default | Override per store |
+| `stores[].embedding` | object | global default | Override per store |
+| `stores[].include` | string[] | global default | Override per store |
+| `stores[].exclude` | string[] | global default | Override per store |
+
+### Config Resolution
+
+1. Look for `memory.config.json` in the project root (where pi was started / cwd)
+2. If not found, look for `.pi/memory.json`
+3. If neither exists, the extension loads silently with no active stores (agent just won't have memory tools)
+4. Store `path` fields are resolved relative to the config file's directory
+
+## Event-Driven Architecture
+
+### Memory Update Flow
 
 ```
-<store path>/
-  memory/
-    architecture.md           # LLM-authored overview, always present
-    modules/
-      auth.md
-      billing.md
-      ...
-    decisions/
-      2026-05-12-jwt-refresh.md
-    notes/
-      gotchas.md
-  index/
-    vec.db                    # sqlite-vec database
-    manifest.json             # chunk metadata, mtimes, hashes
-  raw/                        # last seen project snapshot (for diffs in prompts)
-    tree.txt
-    files.json
+File edited (tool_call/tool_result)
+         │
+         ▼
+Turn ends (turn_end)
+         │
+         ▼
+Debounce (30s default) ──┬── timer fires ──┬── collect changed files
+                         │                 │
+                         ▼                 ▼
+                  If debounce resets   ┌───┘
+                  (new changes)        │
+                         │             ▼
+                         └──► No-op    Ingest job enqueued
+                                           │
+                                           ▼
+                            ┌──────── Ingestion Worker ────────┐
+                            │ 1. Snapshot project state        │
+                            │    (package.json, tree, key src) │
+                            │ 2. Read existing memory markdown │
+                            │ 3. Call ingestion LLM:           │
+                            │    "Here's current state +       │
+                            │     existing memory. Update it." │
+                            │ 4. Parse structured response     │
+                            │ 5. Write updated markdown files  │
+                            │ 6. Re-index changed files:       │
+                            │    chunk → embed → store in vec  │
+                            └─────────────────────────────────┘
 ```
 
-The `raw/` snapshot is used to make ingestion prompts diff-aware ("here is what changed since the last ingestion"). The manifest tracks per-chunk hashes so we only re-embed what changed.
-
-## 4. The ingestion model
-
-### 4.1 Triggers
-
-All triggers enqueue an `IngestJob { storeName, reason, changedFiles? }` into a debounced queue (default debounce 30s, configurable). One worker processes jobs serially per store; multiple stores run in parallel.
-
-| Trigger | Source | Payload |
-|---|---|---|
-| File write/edit | `tool_call` for `write`/`edit` | `changedFiles: [absPath]` |
-| Bulk file ops | `tool_call` for `bash` that touches many files | parsed from command (best-effort) |
-| Turn boundary | `turn_end` | `changedFiles: [paths touched in this turn]` |
-| Manual | `/memory refresh [store]` | `force: true` |
-| Session start | `session_start` (reason `startup`/`new`) | `force: false`; ensures fresh memory after `/new` |
-
-### 4.2 The ingestion prompt
-
-Sent to the ingestion LLM:
+### Query Flow (auto-inject)
 
 ```
-SYSTEM: You maintain a structured memory of a software project. You will
-receive (a) the current memory files for a store, (b) a list of files that
-changed since the last ingestion, and (c) a snapshot of those files.
+User submits prompt
+         │
+         ▼
+before_agent_start
+    │
+    ├─ Is prompt substantive? (length > 10 chars, not a command)
+    │  └─ No → skip injection
+    │
+    ├─ Prompt substantive? ── Yes
+    │   └─ Embed user prompt
+    │      └─ Search all stores for top-K similar chunks
+    │         └─ Format as markdown context block
+    │            └─ Inject into system prompt or as a context message
+    │
+    └─ Append tool description to system prompt:
+       "Use memory_search() and memory_read() for project context."
+```
 
-Produce a JSON object describing updates to the memory. You may create new
-files, update existing ones, or leave them unchanged. Always produce
-`architecture.md` as the canonical project overview; produce per-module
-files only when a module is genuinely worth its own document.
+### Query Flow (on-demand tools)
 
-Output format (strict JSON, no prose):
+```
+LLM decides to call memory_search("auth module")
+         │
+         ▼
+Embed "auth module" → search each store's vec.db → return chunks
+         │
+         ▼
+Return formatted result with file:line references and store name
+```
+
+## Data Flow
+
+### Ingestion LLM Call
+
+The ingestion worker sends to the configured LLM:
+
+```
+System: You are a project documentation writer.
+Your job is to maintain a concise markdown memory of a software project.
+
+Current project root:
+<list of files and directories>
+
+Existing memory files:
+<content of architecture.md, etc.>
+
+Recent changes (files that were edited):
+<diff or file contents for changed files>
+
+Task: Update the memory files to reflect the current state.
+Respond with a JSON object mapping file paths to their new markdown content.
+Only include files that need changes.
+```
+
+### Chunking for Embedding
+
+Each markdown file is split into chunks using a strategy appropriate for markdown:
+
+1. Split on `##` and `###` headings (section-level chunks)
+2. If a section exceeds 512 tokens, further split on paragraphs
+3. Each chunk is stored with:
+   - `store` — store name
+   - `file` — file path relative to store path
+   - `heading` — section heading (for context)
+   - `start_line` / `end_line` — line range in the file
+   - `text` — the chunk text
+   - `embedding` — the vector (F32 BLOB)
+
+### Embedding API Call
+
+For each chunk, the extension calls the configured embedding endpoint:
+
+```
+POST <baseUrl>/embeddings
+Content-Type: application/json
+Authorization: Bearer <apiKey>
+
 {
-  "files": [
-    { "path": "architecture.md", "content": "..." },
-    { "path": "modules/auth.md", "content": "..." },
-    { "path": "modules/billing.md", "delete": true }
-  ],
-  "summary": "One-line description of what changed."
+  "model": "nomic-embed-text",
+  "input": "chunk text here"
+}
+
+Response:
+{
+  "data": [{
+    "embedding": [0.123, -0.456, ...]
+  }]
 }
 ```
 
-The LLM is told it has read-only context, that paths are relative to the store's `memory/` directory, and that it should be **concise** (a hard cap of ~20K tokens of total memory per store, enforced by truncating per-file to 4K tokens and limiting the number of module files to 50).
-
-### 4.3 Applying the result
-
-1. Validate the JSON (schema check). On failure: log, keep the old memory, retry once with a stricter prompt, then surface a `notify` to the user.
-2. Write each file atomically (write to `<path>.tmp` then rename). `delete: true` removes the file.
-3. Re-embed only the files that actually changed (hash compare against manifest).
-4. Update `manifest.json` with new mtime, hash, and chunk offsets.
-
-### 4.4 Graceful degradation
-
-- If ingestion LLM call fails: keep the last good memory, log, surface a non-blocking `notify` ("memory update failed: <reason>; using previous version").
-- If embedding call fails: keep the markdown, mark the store as "no embeddings" — search falls back to keyword.
-- If config file is malformed: extension refuses to load with a clear error message; does not crash the session.
-
-## 5. The search model
-
-### 5.1 Embeddings
-
-Single embedding provider config in the config file. Per-store override is allowed.
-
-Supported providers:
-- `openai-compatible`: POST `{baseUrl}/embeddings` with `{ input, model }`, expects `{ data: [{ embedding: number[] }] }`. Works with OpenAI, vLLM, llama.cpp's server, etc.
-- `ollama`: POST `{baseUrl}/api/embeddings` with `{ model, prompt }`, expects `{ embedding: number[] }`. Note: Ollama embeds one input at a time, so we batch with a small concurrency limit.
-
-Batch size: 32 inputs per call for OpenAI-compat (most providers support this); 8 for Ollama.
-
-The `dimensions` field must match the model. If sqlite-vec was built with a different dimension, we rebuild the index.
-
-### 5.2 sqlite-vec schema
+## Schema (sqlite-vec)
 
 ```sql
-CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING vec0(
-  embedding float[<dimensions>]
+CREATE TABLE chunks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  store TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  heading TEXT,
+  start_line INTEGER,
+  end_line INTEGER,
+  content TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS chunk_meta (
-  id          INTEGER PRIMARY KEY,
-  store       TEXT NOT NULL,
-  file        TEXT NOT NULL,        -- relative to store's memory/
-  start_line  INTEGER NOT NULL,
-  end_line    INTEGER NOT NULL,
-  content     TEXT NOT NULL,
-  hash        TEXT NOT NULL,
-  updated_at  INTEGER NOT NULL
+CREATE TABLE vec_chunks (
+  id INTEGER PRIMARY KEY REFERENCES chunks(id),
+  embedding FLOAT32[dimensions]
 );
-CREATE INDEX idx_chunks_store ON chunk_meta(store);
+
+-- Metadata for cache invalidation
+CREATE TABLE store_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
 ```
 
-Search query: `SELECT file, start_line, end_line, content FROM chunks WHERE embedding MATCH ? AND k = ? ORDER BY distance` joined with `chunk_meta` filtered by store. If `embedding` is NULL (no provider configured), we fall back to:
+## Extension Tools
 
-```sql
-SELECT file, start_line, end_line, content
-FROM chunk_meta
-WHERE store = ?
-  AND (content LIKE ?1 OR content LIKE ?2 OR content LIKE ?3)
-ORDER BY rank;  -- simple bm25 via FTS5 if present, else naive
-```
+### `memory_search(query, stores?, limit?)`
+Semantic search across memory stores.
 
-We use FTS5 as the keyword fallback (always created, even when vec works) for the case of exact-token queries like function names.
+- **query**: natural language search string
+- **stores** (optional): array of store names to search (default: all)
+- **limit** (optional): results per store (default: 5)
+- **Returns**: list of chunks with store, file, lines, content, similarity score
 
-### 5.3 Chunking
+### `memory_read(path)`
+Read a specific memory file verbatim.
 
-Markdown-aware chunker:
-1. Split on H2 (`##`) headings, then merge small adjacent chunks.
-2. If a section is still > `maxTokens`, split on H3, then on sentence boundaries.
-3. Each chunk records its source line range.
-4. Token estimate: `Math.ceil(chars / 4)` — good enough for embedding model context; we don't need exact BPE counts.
+- **path**: path relative to the active store (e.g. `"architecture.md"`)
+- **Returns**: full file content with store name
 
-Code files use a simpler chunker: sliding window of `maxTokens` chars with `overlap`.
+### `memory_write(path, content)`
+Write/update a memory file.
 
-## 6. The user-facing surface
+- **path**: path relative to the active store
+- **content**: markdown content to write
+- **Returns**: confirmation with file path
 
-### 6.1 Tools registered with the LLM
+### `memory_refresh()`
+Force re-ingestion of the project state.
 
-| Tool | Args | Purpose |
-|---|---|---|
-| `memory_search` | `query: string, store?: string, limit?: number` | Semantic + keyword search across stores. Returns: store, file, line range, snippet, score. |
-| `memory_read` | `path: string, store?: string` | Return raw markdown of a memory file. |
-| `memory_write` | `path: string, content: string, store?: string` | Add/edit a memory entry directly. Goes through the same embedding pipeline. |
-| `memory_refresh` | `store?: string` | Force ingestion now. |
-| `memory_status` | `store?: string` | List stores, last update time, embedding provider, chunk count, total memory size. |
+- **Returns**: status of the ingestion job
 
-Each tool has a one-line `promptSnippet` and a `promptGuidelines` bullet so the LLM knows they exist.
+### `memory_status()`
+Show memory store status.
 
-### 6.2 Slash commands
+- **Returns**: list of stores with file count, last updated, model info
 
-| Command | Purpose |
-|---|---|
-| `/memory` | Show `memory_status` output. |
-| `/memory refresh [store]` | Force ingestion. |
-| `/memory search <query>` | Interactive search; shows top results in a TUI panel. |
-| `/memory show <path>` | Print a memory file. |
-| `/memory config` | Print resolved config (after env expansion). |
+## Extension Events
 
-### 6.3 Automatic context injection
+### `turn_end` handler
+Debounced trigger for ingestion. Detects whether relevant files were modified during the turn.
 
-On `before_agent_start`:
+### `before_agent_start` handler
+Auto-injects memory context for substantive prompts. Appends tool descriptions to system prompt.
 
-1. If the prompt is trivial (length < 8 chars, or matches `/^(y|yes|no|ok|continue|go|sure|thanks|thank you|hi|hello)[.!]?$/i`), skip.
-2. Compute the embedding of the prompt.
-3. For each store, get top-2 chunks by similarity. Total budget: 1500 tokens.
-4. Build a `<project_memory>` block and append to system prompt:
+### `session_start` handler
+Loads config and initializes stores. Builds vector index if missing.
 
-```
-<project_memory stores="project, platform">
-## project / architecture.md (L1-12)
-[excerpt]
-## platform / services/payments.md (L40-67)
-[excerpt]
-</project_memory>
-```
+### `session_shutdown` handler
+Clean shutdown of any pending ingestion jobs.
 
-If embeddings are unavailable, use the prompt's noun phrases (a simple regex) as keyword queries to FTS5.
+## Commands
 
-### 6.4 Status footer
+### `/memory refresh`
+Force re-ingestion.
 
-`ctx.ui.setStatus("memory", "memory: 3 stores, last 2m ago")` so the user can see the state at a glance.
+### `/memory status`
+Display store status in TUI.
 
-## 7. Configuration: where things come from
+### `/memory rebuild`
+Drop and rebuild all vector indexes from markdown files.
 
-Resolution order (first wins) for any setting:
+## Dependencies
 
-1. CLI flag: `pi --memory-config /path/to/config.json`
-2. `MEMORY_CONFIG` env var
-3. `./memory.config.json`
-4. `./.pi/memory.json`
-5. Built-in defaults (single `default` store, no embeddings, active model for ingestion)
+- `sqlite-vec` — SQLite vector extension (npm package)
+- Uses Node.js built-in `node:sqlite` (available in Node 24+; polyfill via `better-sqlite3` if needed)
 
-Environment variable expansion: any string value of the form `${VAR}` is replaced with `process.env.VAR`. Missing vars cause a clear error at load time.
+No heavy dependencies. Embedding is done via plain `fetch()` to the configured HTTP endpoint.
 
-Per-project config can be committed to git; per-user secrets (API keys) go through env expansion so the config file itself stays safe to commit.
+## Error Handling
 
-## 8. Files in the extension
-
-The extension lives in this repo, packaged as an npm-style extension (its own `package.json` + `node_modules`):
-
-```
-/home/pakky/projects/pi-project-memory/
-├── package.json
-├── README.md
-├── src/
-│   ├── index.ts                  # entry: extension factory, event wiring
-│   ├── config.ts                 # config loading, validation, env expansion
-│   ├── store.ts                  # StoreManager: per-store state
-│   ├── markdown.ts               # markdown read/write atomic, chunker
-│   ├── embeddings.ts             # provider abstraction (openai-compat, ollama)
-│   ├── vec.ts                    # sqlite-vec schema, query helpers
-│   ├── ingest/
-│   │   ├── queue.ts              # debounced IngestQueue
-│   │   ├── worker.ts             # one per store, runs ingestion
-│   │   ├── prompt.ts             # builds ingestion prompt
-│   │   ├── apply.ts              # validates LLM JSON, writes files
-│   │   └── snapshot.ts           # builds the project snapshot (raw/)
-│   ├── search.ts                 # search engine (vec + FTS5 fallback)
-│   ├── context.ts                # before_agent_start injection
-│   └── tools.ts                  # the five tools
-├── tsconfig.json
-└── docs/
-    └── plans/
-        └── 2026-06-07-pi-project-memory-design.md
-```
-
-Dependencies (`package.json`):
-- `@earendil-works/pi-coding-agent` (peer, from pi's node_modules)
-- `@earendil-works/pi-ai` (peer)
-- `typebox` (peer, from pi)
-- `better-sqlite3` — synchronous, simple, well-supported; sqlite-vec is officially compatible
-- `sqlite-vec` — the extension load function
-- (no embedding HTTP client — we use `fetch` from `node:undici`/built-in)
-
-The extension's `package.json` declares `"pi": { "extensions": ["./src/index.ts"] }` so it can be installed via `pi install` (npm path) or referenced directly from `~/.pi/agent/extensions/`.
-
-## 9. Error handling & resilience
-
-| Failure | Behavior |
-|---|---|
-| Config missing | Run in default mode (single `default` store, no embeddings). |
-| Config malformed | Extension refuses to load; surface clear error. |
-| Config refers to non-existent path | Create it on first write. |
-| Ingest LLM call fails | Keep prior memory; `notify("memory update failed", "warning")`; retry once. |
-| Ingest LLM returns invalid JSON | Reject, retry once with stricter prompt. |
-| Embedding call fails | Mark store as "no embeddings"; keyword fallback. |
-| sqlite-vec load fails (binary missing, etc.) | Fall back to FTS5-only search. |
-| Disk write fails | Leave the old file in place; surface a `notify`. |
-| Concurrent ingestion for same store | Queue serializes per-store jobs. |
-| Process crash mid-write | Atomic writes (write to `.tmp` then rename) prevent partial files. |
-| Memory grows too large | Hard cap: 20K tokens per store; oldest non-`architecture.md` files pruned first. |
-
-## 10. Testing
-
-- Unit tests for: config loader (env expansion, validation, defaults), markdown chunker, embedding provider abstraction with a stubbed `fetch`, vec schema migration, search with both backends.
-- Integration tests using a temp dir + a fake LLM HTTP server (returns canned JSON) to drive the full ingest→embed→search flow.
-- Manual smoke test: load the extension in pi, point it at a small real project, run `/memory refresh`, then `memory_search("how does auth work")` and verify results.
-- A test fixture project under `tests/fixtures/sample-project/` with a known set of files and expected memory output.
-
-## 11. Out of scope (deliberately deferred)
-
-- Web UI / browser inspector for memory
-- Sync between local and remote memory (e.g. S3, git remote)
-- Re-ranking (cross-encoder, etc.) — embeddings-only at v1
-- Incremental embeddings of massive monorepos (we cap at 20K tokens of memory per store)
-- Multi-user / team memory sharing
-- TUI widget for browsing memory (we surface results inline)
-
-## 12. Open questions / future work
-
-- Should we add a TUI browser for memory? Defer.
-- Should we support `.pi/memory/**` git tracking helpers (e.g. `/memory commit`)? Defer.
-- Should ingestion also have access to the agent's conversation history for context? Tempting, but out of scope for v1 to keep ingestion prompts focused on code state.
+- **Config errors**: Store fails to load → log warning, continue without that store, notify user once
+- **Embedding failure**: Retry once after 2s; if still fails, skip embedding for that chunk, log warning; use zero-vector placeholder
+- **Ingestion LLM failure**: Retry once; if still fails, skip this ingestion cycle; mark as needing refresh
+- **sqlite-vec load failure**: Degrade gracefully — markdown files still work, memory tools still work, semantic search returns "not available"
+- **Concurrent ingestion**: Lock with a simple in-memory flag per store; skip duplicate if already running
