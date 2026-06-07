@@ -33,6 +33,12 @@ export default function (pi: ExtensionAPI) {
   let currentModelAuth: { apiKey?: string; headers?: Record<string, string> } | null = null;
   let toolsRegistered = false;
 
+  // Captured UI handle — persists across event handlers so background ingestion can show feedback
+  let ui: {
+    notify: (msg: string, level?: "info" | "warning" | "error") => void;
+    setStatus: (id: string, status?: string) => void;
+  } | null = null;
+
   // ─── Helpers ───────────────────────────────────────────
 
   function createLlmContext(): LlmContext {
@@ -91,6 +97,21 @@ export default function (pi: ExtensionAPI) {
     worker = new IngestionWorker(
       new Map(Array.from(stores.entries()).map(([n, s]) => [n, { store: s.store, indexer: s.indexer, config: s.config }])),
       createLlmContext, cwd, loaded[0]?.debounceMs ?? 30_000,
+      (storeName, status, detail) => {
+        if (!ui) return;
+        // Clear any pending indicator once something happens
+        ui.setStatus("memory:pending", undefined);
+        const label = `memory:${storeName}`;
+        if (status === "ingesting") {
+          ui.setStatus(label, `🧠 ${detail ?? "ingesting..."}`);
+        } else if (status === "complete") {
+          ui.setStatus(label, undefined);
+          ui.notify(`🧠 Memory updated: ${storeName} — ${detail ?? "done"}`, "info");
+        } else if (status === "failed") {
+          ui.setStatus(label, undefined);
+          ui.notify(`🧠 Memory ingestion failed: ${storeName} — ${detail ?? "unknown error"}`, "warning");
+        }
+      },
     );
 
     for (const [, s] of stores) {
@@ -150,6 +171,14 @@ export default function (pi: ExtensionAPI) {
   // ─── Events ────────────────────────────────────────────
 
   pi.on("session_start", async (event, ctx) => {
+    // Capture UI handle for background ingestion feedback
+    if (ctx.hasUI) {
+      ui = {
+        notify: (msg, level) => ctx.ui.notify(msg, level ?? "info"),
+        setStatus: (id, status) => ctx.ui.setStatus(id, status),
+      };
+    }
+
     if (ctx.model) {
       currentModel = ctx.model;
       try {
@@ -318,6 +347,7 @@ export default function (pi: ExtensionAPI) {
     stores.clear();
     currentModel = null;
     currentModelAuth = null;
+    ui = null;
     toolsRegistered = false;
   });
 
@@ -325,6 +355,7 @@ export default function (pi: ExtensionAPI) {
     if (!worker || stores.size === 0) return;
     const tr = event.toolResults ?? [];
     if (!tr.some((t) => t.toolName === "write" || t.toolName === "edit" || t.toolName === "bash")) return;
+    ui?.setStatus("memory:pending", `🧠 Changes detected — scheduling ingestion...`);
     for (const [name] of stores) worker.schedule(name);
   });
 

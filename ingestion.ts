@@ -63,7 +63,7 @@ export class IngestionWorker {
   private _getLlmContext: () => LlmContext;
   private _cwd: string;
   private _debounceMs: number;
-  private _onStatusChange?: (store: string, status: string) => void;
+  private _onStatusChange?: (store: string, status: string, detail?: string) => void;
 
   constructor(
     stores: Map<
@@ -77,7 +77,7 @@ export class IngestionWorker {
     getLlmContext: () => LlmContext,
     cwd: string,
     debounceMs: number = 30_000,
-    onStatusChange?: (store: string, status: string) => void,
+    onStatusChange?: (store: string, status: string, detail?: string) => void,
   ) {
     this._stores = stores;
     this._getLlmContext = getLlmContext;
@@ -132,7 +132,7 @@ export class IngestionWorker {
     }
 
     this._isRunning = true;
-    this._onStatusChange?.(storeName, "ingesting");
+    this._onStatusChange?.(storeName, "ingesting", "Discovering project files...");
 
     try {
       const { store, indexer, config } = entry;
@@ -143,6 +143,7 @@ export class IngestionWorker {
         files.slice(0, 100).map((f) => [f.relativePath, f.content]),
       );
       const fileTree = getProjectTree(this._cwd, config.exclude);
+      this._onStatusChange?.(storeName, "ingesting", `Found ${files.length} project files`);
 
       // 2. Read existing memory
       const existingMemory = new Map<string, string>();
@@ -152,6 +153,7 @@ export class IngestionWorker {
           existingMemory.set(relPath, content);
         }
       }
+      this._onStatusChange?.(storeName, "ingesting", `${existingMemory.size} memory files loaded`);
 
       // 3. Call ingestion LLM
       const llm = this._getLlmContext();
@@ -166,6 +168,7 @@ export class IngestionWorker {
         includePatterns: config.include,
         excludePatterns: config.exclude,
       });
+      this._onStatusChange?.(storeName, "ingesting", "LLM analyzing project...");
 
       const response = await llm.complete({
         model: { id: config.ingestionModel ?? "active", provider: config.ingestionModel?.split("/")[0] ?? "active" },
@@ -180,6 +183,7 @@ export class IngestionWorker {
         console.warn(
           `[pi-project-memory] Ingestion LLM returned unparseable response for "${storeName}"`,
         );
+        this._onStatusChange?.(storeName, "failed", "LLM response was not parseable");
         return;
       }
 
@@ -189,16 +193,18 @@ export class IngestionWorker {
         store.writeFile(filePath, content);
         changedFiles.push(filePath);
       }
+      this._onStatusChange?.(storeName, "ingesting", `${changedFiles.length} memory files updated`);
 
       // 6. Re-index changed files
       if (changedFiles.length > 0) {
+        this._onStatusChange?.(storeName, "ingesting", "Re-indexing chunks...");
         await indexer.indexFiles(changedFiles);
       }
 
       // 7. Update metadata
       store.setLastIngestedAt(new Date().toISOString());
 
-      this._onStatusChange?.(storeName, "ingested");
+      this._onStatusChange?.(storeName, "complete", `${changedFiles.length} files, ${existingMemory.size + changedFiles.length} total memory files`);
     } finally {
       this._isRunning = false;
 
