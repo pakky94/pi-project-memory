@@ -1,30 +1,23 @@
 /**
  * pi-project-memory — main extension entry point.
  *
- * Wires together:
- * - Config loading and store initialization
- * - Custom tools (memory_search, memory_read, memory_write, memory_refresh, memory_status)
- * - Commands (/memory)
- * - Event handlers (auto-ingest, auto-inject)
+ * When no memory.config.json exists: only the `memory_init` tool is available
+ * to help the user set up project memory interactively.
+ *
+ * When a config is found: 5 tools + /memory command + auto-ingest/inject
+ * are registered in session_start.
+ *
+ * The full toolset is registered only once (first session_start where stores exist).
  */
 
-import type {
-  ExtensionAPI,
-  ExtensionCommandContext,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { complete, getModel } from "@earendil-works/pi-ai";
 
-import { loadStores, type StoreConfigResolved } from "./config.ts";
-import { MemoryStore } from "./store.ts";
+import { loadStores, type StoreConfigResolved, type MemoryConfig } from "./config.ts";
+import { MemoryStore, type SearchResult } from "./store.ts";
 import { MemoryIndexer } from "./indexer.ts";
-import {
-  createEmbeddingProvider,
-  BatchEmbedder,
-} from "./embedding.ts";
+import { createEmbeddingProvider, BatchEmbedder } from "./embedding.ts";
 import { IngestionWorker, type LlmContext } from "./ingestion.ts";
-import type { MemoryConfig } from "./config.ts";
-import type { SearchResult } from "./store.ts";
 
 interface StoreState {
   store: MemoryStore;
@@ -35,621 +28,334 @@ interface StoreState {
 
 export default function (pi: ExtensionAPI) {
   let stores: Map<string, StoreState> = new Map();
-  let config: MemoryConfig | null = null;
   let worker: IngestionWorker | null = null;
-  let initialized = false;
+  let currentModel: any = null;
+  let currentModelAuth: { apiKey?: string; headers?: Record<string, string> } | null = null;
+  let toolsRegistered = false;
 
   // ─── Helpers ───────────────────────────────────────────
 
   function createLlmContext(): LlmContext {
     return {
       async complete(params) {
-        const modelId = params.model.id;
-        const providerId = params.model.provider;
+        let model = currentModel;
+        let apiKey = currentModelAuth?.apiKey;
+        let headers = currentModelAuth?.headers;
 
-        const model = getModel(providerId as any, modelId as any);
-        if (!model) {
-          throw new Error(
-            `Ingestion model not found: ${providerId}/${modelId}`,
-          );
+        if (params.model.id !== "active") {
+          try {
+            const { getModel } = await import("@earendil-works/pi-ai");
+            const resolved = getModel(params.model.provider as any, params.model.id as any);
+            if (resolved) {
+              model = resolved;
+              apiKey = params.apiKey || undefined;
+              headers = undefined;
+            }
+          } catch { /* fallback to session model */ }
         }
 
-        const messages = [
-          {
-            role: "system" as const,
-            content: [{ type: "text" as const, text: params.systemPrompt }],
-            timestamp: Date.now(),
-          },
-          {
-            role: "user" as const,
-            content: [{ type: "text" as const, text: params.userPrompt }],
-            timestamp: Date.now(),
-          },
-        ];
+        if (!model) {
+          console.warn("[pi-project-memory] No model available for ingestion. Skipping.");
+          return { content: '{"files":{}}' };
+        }
 
-        const response = await complete(
-          model,
-          { messages },
-          {
-            apiKey: params.apiKey || undefined,
-            signal: params.signal,
-          },
-        );
+        const { complete: piComplete } = await import("@earendil-works/pi-ai");
+        const response = await piComplete(model, { messages: [
+          { role: "system" as const, content: [{ type: "text" as const, text: params.systemPrompt }], timestamp: Date.now() },
+          { role: "user" as const, content: [{ type: "text" as const, text: params.userPrompt }], timestamp: Date.now() },
+        ]}, { apiKey, headers, signal: params.signal });
 
-        const text = response.content
-          .filter((c): c is { type: "text"; text: string } => c.type === "text")
-          .map((c) => c.text)
-          .join("\n");
-
-        return { content: text };
+        return { content: response.content.filter((c): c is { type: "text"; text: string } => c.type === "text").map((c) => c.text).join("\n") };
       },
     };
   }
 
-  function getActiveStore(ctx: {
-    cwd: string;
-    modelRegistry: any;
-    model: any;
-  }): string | null {
-    if (stores.size === 0) return null;
-    // Return first store as default
-    return stores.keys().next().value ?? null;
-  }
-
-  function getStoreState(name: string): StoreState | undefined {
-    return stores.get(name);
-  }
-
-  async function initializeStores(cwd: string): Promise<void> {
-    // Close existing stores
-    for (const [, state] of stores) {
-      state.store.close();
-    }
+  async function initStores(cwd: string): Promise<void> {
+    for (const [, s] of stores) s.store.close();
     stores.clear();
 
-    config = null;
+    const loaded = loadStores(cwd);
+    if (loaded.length === 0) return;
 
-    // Load config
-    const loadedConfig = loadStores(cwd);
-    if (loadedConfig.length === 0) return;
-
-    for (const cfg of loadedConfig) {
+    for (const cfg of loaded) {
       const store = new MemoryStore(cfg);
       await store.init();
-
       let embedder: BatchEmbedder | null = null;
       if (cfg.embedding) {
         const provider = createEmbeddingProvider(cfg.embedding);
-        if (provider) {
-          embedder = new BatchEmbedder(provider);
-        }
+        if (provider) embedder = new BatchEmbedder(provider);
       }
-
-      // If no embedding configured, indexer falls back to text search
-      const indexer = new MemoryIndexer(store, embedder);
-
-      stores.set(cfg.name, { store, indexer, embedder, config: cfg });
+      stores.set(cfg.name, { store, indexer: new MemoryIndexer(store, embedder), embedder, config: cfg });
     }
 
-    // Create ingestion worker
     worker = new IngestionWorker(
-      new Map(
-        Array.from(stores.entries()).map(([name, state]) => [
-          name,
-          { store: state.store, indexer: state.indexer, config: state.config },
-        ]),
-      ),
-      createLlmContext,
-      cwd,
-      loadedConfig[0]?.debounceMs ?? 30_000,
-      (storeName, status) => {
-        // Could notify user here
-      },
+      new Map(Array.from(stores.entries()).map(([n, s]) => [n, { store: s.store, indexer: s.indexer, config: s.config }])),
+      createLlmContext, cwd, loaded[0]?.debounceMs ?? 30_000,
     );
 
-    // Initial indexing: if stores have existing files but no vec index, build it
-    for (const [name, state] of stores) {
-      const needsBuild = await state.indexer.needsRebuild();
-      if (needsBuild) {
-        const files = state.store.listRelativeFiles();
-        if (files.length > 0) {
-          await state.indexer.reindex();
-        }
+    for (const [, s] of stores) {
+      if (await s.indexer.needsRebuild()) {
+        const files = s.store.listRelativeFiles();
+        if (files.length > 0) await s.indexer.reindex();
       }
     }
   }
+
+  function activeStore(): string | null {
+    return stores.size > 0 ? stores.keys().next().value ?? null : null;
+  }
+
+  // ─── memory_init — always available ──────────────────
+
+  pi.registerTool({
+    name: "memory_init",
+    label: "Memory Init",
+    description: "Set up project memory for this project. Creates a memory.config.json file.",
+    promptSnippet: "Initialize project memory configuration",
+    promptGuidelines: ["Use memory_init when the user wants to set up project memory or when no memory stores are available."],
+    parameters: Type.Object({
+      stores: Type.Array(Type.Object({
+        name: Type.String({ description: "Name for this memory store (e.g. 'project', 'platform')" }),
+        path: Type.Optional(Type.String({ description: "Path for the store (default: ./.pi/memory/<name>)" })),
+      }), { description: "List of memory stores to create" }),
+      embedding: Type.Optional(Type.Object({
+        baseUrl: Type.String({ description: "Embedding service URL (e.g. http://localhost:11434/v1)" }),
+        model: Type.String({ description: "Embedding model name (e.g. nomic-embed-text)" }),
+        dimensions: Type.Number({ description: "Embedding dimensions (e.g. 768)" }),
+      }), { description: "Optional embedding configuration for semantic search" }),
+    }),
+    async execute(toolCallId, params, signal, onUpdate, ctx) {
+      const storeList = params.stores as Array<{ name: string; path?: string }>;
+      const embeddingCfg = params.embedding as { baseUrl: string; model: string; dimensions: number } | undefined;
+
+      const config: MemoryConfig = {
+        stores: storeList.map((s) => ({ name: s.name, path: s.path ?? `./.pi/memory/${s.name}` })),
+      };
+      if (embeddingCfg) {
+        config.defaults = { embedding: { provider: "openai-compatible", baseUrl: embeddingCfg.baseUrl, model: embeddingCfg.model, dimensions: embeddingCfg.dimensions } };
+      }
+
+      const { writeFileSync } = await import("node:fs");
+      const { resolve } = await import("node:path");
+      const configPath = resolve(ctx.cwd, "memory.config.json");
+      writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
+
+      return {
+        content: [{ type: "text" as const, text: `Created memory.config.json at ${configPath}\n\nStores: ${storeList.map((s) => s.name).join(", ")}\nEmbedding: ${embeddingCfg ? "configured" : "none (text search)"}\n\nRun memory_refresh() to start ingesting, or use memory_write() to add files manually.` }],
+        details: { configPath },
+      };
+    },
+  });
 
   // ─── Events ────────────────────────────────────────────
 
   pi.on("session_start", async (event, ctx) => {
-    await initializeStores(ctx.cwd);
-    initialized = true;
+    if (ctx.model) {
+      currentModel = ctx.model;
+      try {
+        const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+        if (auth.ok) currentModelAuth = { apiKey: auth.apiKey, headers: auth.headers };
+      } catch {}
+    }
+
+    await initStores(ctx.cwd);
+
+    if (stores.size > 0 && !toolsRegistered) {
+      // ── Register the full toolset once stores exist ──
+
+      pi.registerTool({
+        name: "memory_search",
+        label: "Memory Search",
+        description: "Search project memory stores semantically. Returns relevant chunks with file:line references.",
+        promptSnippet: "Search project memory for relevant context",
+        promptGuidelines: ["Use memory_search when you need to understand project architecture, find relevant modules, or recall project decisions."],
+        parameters: Type.Object({
+          query: Type.String({ description: "Natural language search query" }),
+          stores: Type.Optional(Type.Array(Type.String({ description: "Store names to search (default: all)" }))),
+          limit: Type.Optional(Type.Number({ description: "Results per store (default: 5)" })),
+        }),
+        async execute(toolCallId, params, signal, onUpdate, ctx) {
+          const query = params.query as string;
+          const storeNames = params.stores as string[] | undefined;
+          const limit = (params.limit as number) ?? 5;
+          const targetNames = storeNames ? storeNames.filter((n) => stores.has(n)) : Array.from(stores.keys());
+          const all: SearchResult[] = [];
+          for (const name of targetNames) {
+            const state = stores.get(name);
+            if (!state) continue;
+            all.push(...(await state.indexer.search(query, limit)));
+          }
+          if (all.length === 0) return { content: [{ type: "text" as const, text: "No relevant memory found." }], details: {} };
+          all.sort((a, b) => a.distance - b.distance);
+          const formatted = all.slice(0, limit * targetNames.length).map((r, i) => {
+            const ref = r.heading ? `${r.store}/${r.filePath} > ${r.heading}` : `${r.store}/${r.filePath}`;
+            return `**${i + 1}. ${ref}** (lines ${r.startLine}-${r.endLine})\n${r.content}`;
+          }).join("\n\n---\n\n");
+          return { content: [{ type: "text" as const, text: formatted }], details: { count: all.length } };
+        },
+      });
+
+      pi.registerTool({
+        name: "memory_read",
+        label: "Memory Read",
+        description: "Read a specific memory file verbatim.",
+        parameters: Type.Object({
+          path: Type.String({ description: "File path relative to the memory store" }),
+          store: Type.Optional(Type.String({ description: "Store name (default: first store)" })),
+        }),
+        async execute(toolCallId, params, signal, onUpdate, ctx) {
+          const path = params.path as string;
+          const storeName = (params.store as string) ?? activeStore();
+          if (!storeName || !stores.has(storeName)) return { content: [{ type: "text" as const, text: `Store "${storeName}" not found.` }], details: {}, isError: true };
+          const state = stores.get(storeName)!;
+          const content = state.store.readFile(path);
+          if (content === null) return { content: [{ type: "text" as const, text: `File "${path}" not found in "${storeName}".` }], details: {}, isError: true };
+          return { content: [{ type: "text" as const, text: `## ${storeName}/${path}\n\n${content}` }], details: { store: storeName, path, size: content.length } };
+        },
+      });
+
+      pi.registerTool({
+        name: "memory_write",
+        label: "Memory Write",
+        description: "Write or update a memory file. Use this to record decisions, patterns, or any information about the project.",
+        parameters: Type.Object({
+          path: Type.String({ description: "File path relative to memory store (e.g. decisions.md)" }),
+          content: Type.String({ description: "Markdown content to write" }),
+          store: Type.Optional(Type.String({ description: "Store name (default: first store)" })),
+        }),
+        async execute(toolCallId, params, signal, onUpdate, ctx) {
+          const path = params.path as string;
+          const content = params.content as string;
+          const storeName = (params.store as string) ?? activeStore();
+          if (!storeName || !stores.has(storeName)) return { content: [{ type: "text" as const, text: `Store "${storeName}" not found.` }], details: {}, isError: true };
+          const state = stores.get(storeName)!;
+          state.store.writeFile(path, content);
+          await state.indexer.indexFiles([path]);
+          return { content: [{ type: "text" as const, text: `Written to ${storeName}/${path} (${content.length} chars) and re-indexed.` }], details: { store: storeName, path, size: content.length } };
+        },
+      });
+
+      pi.registerTool({
+        name: "memory_refresh",
+        label: "Memory Refresh",
+        description: "Force re-ingestion of the project state. Memory files are regenerated by analyzing the current codebase.",
+        parameters: Type.Object({}),
+        async execute(toolCallId, params, signal, onUpdate, ctx) {
+          if (!worker || stores.size === 0) return { content: [{ type: "text" as const, text: "No memory stores configured." }], details: {} };
+          const results: string[] = [];
+          for (const [name] of stores) {
+            if (signal?.aborted) break;
+            await worker.runIngestion(name);
+            results.push(`${name}: ingested`);
+          }
+          return { content: [{ type: "text" as const, text: `Memory refresh complete:\n${results.map((r) => `  - ${r}`).join("\n")}` }], details: { results } };
+        },
+      });
+
+      pi.registerTool({
+        name: "memory_status",
+        label: "Memory Status",
+        description: "Show memory store status: stores loaded, file count, last updated, model info.",
+        parameters: Type.Object({}),
+        async execute(toolCallId, params, signal, onUpdate, ctx) {
+          if (stores.size === 0) return { content: [{ type: "text" as const, text: "No memory stores configured." }], details: {} };
+          const lines: string[] = [];
+          for (const [name, state] of stores) {
+            const files = state.store.listRelativeFiles();
+            const lastIngested = state.store.getLastIngestedAt();
+            const chunkCount = await state.indexer.chunkCount();
+            const searchMode = state.embedder ? `semantic (${state.config.embedding?.provider}/${state.config.embedding?.model})` : "text (keyword)";
+            lines.push(`### ${name}\n- Path: \`${state.config.path}\`\n- Memory files: ${files.length}\n- Indexed chunks: ${chunkCount}\n- Last ingested: ${lastIngested ?? "never"}\n- Search mode: ${searchMode}\n- Ingestion model: ${state.config.ingestionModel ?? "active (default)"}`);
+          }
+          return { content: [{ type: "text" as const, text: lines.join("\n\n") }], details: { storeCount: stores.size, storeNames: Array.from(stores.keys()) } };
+        },
+      });
+
+      // ── Commands ──
+      pi.registerCommand("memory", {
+        description: "Manage project memory. Subcommands: refresh, status, rebuild",
+        handler: async (args, ctx) => {
+          const parts = (args || "").trim().split(/\s+/);
+          const subcmd = parts[0] || "status";
+          if (stores.size === 0) { ctx.ui.notify("No memory stores configured", "warning"); return; }
+          if (subcmd === "refresh") {
+            ctx.ui.notify("Refreshing memory...", "info");
+            for (const [name] of stores) await worker!.runIngestion(name);
+            ctx.ui.notify("Memory refresh complete", "info");
+          } else if (subcmd === "status") {
+            const lines = ["Project Memory Status", ""];
+            for (const [name, state] of stores) {
+              const files = state.store.listRelativeFiles();
+              const lastIngested = state.store.getLastIngestedAt();
+              lines.push(`  ${name}:\n    Path: ${state.config.path}\n    Files: ${files.length}\n    Last ingested: ${lastIngested ?? "never"}`);
+            }
+            ctx.ui.notify(lines.join("\n"), "info");
+          } else if (subcmd === "rebuild") {
+            ctx.ui.notify("Rebuilding vector indexes...", "info");
+            for (const [, state] of stores) await state.indexer.reindex();
+            ctx.ui.notify("Vector indexes rebuilt", "info");
+          } else {
+            ctx.ui.notify(`Unknown: ${subcmd}. Use: refresh, status, rebuild`, "warning");
+          }
+        },
+      });
+
+      toolsRegistered = true;
+    }
+  });
+
+  pi.on("model_select", async (event, ctx) => {
+    currentModel = event.model;
+    try {
+      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(event.model);
+      if (auth.ok) currentModelAuth = { apiKey: auth.apiKey, headers: auth.headers };
+    } catch {}
   });
 
   pi.on("session_shutdown", async () => {
     worker?.cancel();
-    for (const [, state] of stores) {
-      state.store.close();
-    }
+    for (const [, s] of stores) s.store.close();
     stores.clear();
-    initialized = false;
+    currentModel = null;
+    currentModelAuth = null;
+    toolsRegistered = false;
   });
 
-  pi.on("turn_end", async (event, ctx) => {
+  pi.on("turn_end", async (event) => {
     if (!worker || stores.size === 0) return;
-
-    // Check if any write/edit tool modified project files
-    const toolResults = event.toolResults ?? [];
-    let hasFileChanges = false;
-
-    for (const tr of toolResults) {
-      if (
-        tr.toolName === "write" ||
-        tr.toolName === "edit" ||
-        tr.toolName === "bash"
-      ) {
-        hasFileChanges = true;
-        break;
-      }
-    }
-
-    if (!hasFileChanges) return;
-
-    // Schedule ingestion for all stores
-    for (const [name] of stores) {
-      worker.schedule(name);
-    }
+    const tr = event.toolResults ?? [];
+    if (!tr.some((t) => t.toolName === "write" || t.toolName === "edit" || t.toolName === "bash")) return;
+    for (const [name] of stores) worker.schedule(name);
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
     if (stores.size === 0) return;
 
-    // Append tool descriptions to system prompt
-    let toolNote =
-      "\n\n## Project Memory\n\nYou have access to project memory that helps you understand the codebase. Use these tools:\n";
-    toolNote +=
-      "- `memory_search(query)` — semantically search project memory for relevant context\n";
-    toolNote +=
-      "- `memory_read(path)` — read a specific memory file verbatim\n";
-    toolNote +=
-      "- `memory_write(path, content)` — record a note or decision for future reference\n";
-    toolNote +=
-      "- `memory_status()` — see which memory stores are loaded\n\n";
-    toolNote += `Active stores: ${Array.from(stores.keys()).join(", ")}\n`;
+    const storeNames = Array.from(stores.keys()).join(", ");
+    let note = `\n\n## Project Memory\n\nYou have access to project memory:\n- \`memory_search(query)\` — search for relevant context\n- \`memory_read(path)\` — read a memory file\n- \`memory_write(path, content)\` — record notes or decisions\n- \`memory_status()\` — check loaded stores\n\nActive stores: ${storeNames}\n`;
 
-    // Auto-inject context for substantive prompts
-    if (
-      isSubstantivePrompt(event.prompt) &&
-      stores.size > 0
-    ) {
-      // Try to embed the prompt and find relevant context (best-effort)
+    if (isSubstantive(event.prompt)) {
       try {
-        const allResults: SearchResult[] = [];
-        for (const [, state] of stores) {
-          try {
-            const results = await state.indexer.search(event.prompt, 3);
-            allResults.push(...results);
-          } catch {
-            // Best-effort — one store failing shouldn't block others
-          }
+        const all: SearchResult[] = [];
+        for (const [, state] of stores) { try { all.push(...(await state.indexer.search(event.prompt, 3))); } catch {} }
+        if (all.length > 0) {
+          all.sort((a, b) => a.distance - b.distance);
+          const ctxLines = ["\n\n## Relevant Project Context\n", ...all.slice(0, 5).map((r) => {
+            const ref = r.heading ? `${r.filePath} > ${r.heading}` : r.filePath;
+            return `**${ref}** (lines ${r.startLine}-${r.endLine}):\n> ${r.content.slice(0, 200).replace(/\n/g, "\n> ")}`;
+          })];
+          note += ctxLines.join("\n\n");
         }
-
-        if (allResults.length > 0) {
-          // Sort by distance (ascending = most similar)
-          allResults.sort((a, b) => a.distance - b.distance);
-          const topResults = allResults.slice(0, 5);
-
-          const contextLines = [
-            "\n\n## Relevant Project Context\n\nFrom your project memory:\n",
-          ];
-          for (const r of topResults) {
-            const ref = r.heading
-              ? `${r.filePath} > ${r.heading}`
-              : r.filePath;
-            contextLines.push(
-              `**${ref}** (lines ${r.startLine}-${r.endLine}):\n> ${r.content.slice(0, 200).replace(/\n/g, "\n> ")}`,
-            );
-          }
-          toolNote += contextLines.join("\n\n");
-        }
-      } catch {
-        // Auto-inject failed silently — system prompt still gets tool descriptions
-      }
+      } catch {}
     }
-
-    return {
-      systemPrompt: event.systemPrompt + toolNote,
-    };
-  });
-
-  // ─── Tools ─────────────────────────────────────────────
-
-  pi.registerTool({
-    name: "memory_search",
-    label: "Memory Search",
-    description:
-      "Search project memory stores semantically. Returns relevant chunks with file:line references.",
-    promptSnippet: "Search project memory for relevant context",
-    promptGuidelines: [
-      "Use memory_search when you need to understand project architecture, find relevant modules, or recall project decisions.",
-    ],
-    parameters: Type.Object({
-      query: Type.String({
-        description: "Natural language search query",
-      }),
-      stores: Type.Optional(
-        Type.Array(
-          Type.String({ description: "Store names to search (default: all)" }),
-        ),
-      ),
-      limit: Type.Optional(
-        Type.Number({ description: "Results per store (default: 5)" }),
-      ),
-    }),
-    async execute(toolCallId, params, signal, onUpdate, ctx) {
-      const query = params.query as string;
-      const storeNames = params.stores as string[] | undefined;
-      const limit = (params.limit as number) ?? 5;
-
-      const targetStores = storeNames
-        ? storeNames.filter((n) => stores.has(n))
-        : Array.from(stores.keys());
-
-      const allResults: SearchResult[] = [];
-
-      for (const name of targetStores) {
-        const state = stores.get(name);
-        if (!state) continue;
-
-        const results = await state.indexer.search(query, limit);
-        allResults.push(...results);
-      }
-
-      if (allResults.length === 0) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "No relevant memory found. Try a different query or use memory_status() to check which stores are loaded.",
-            },
-          ],
-          details: {},
-        };
-      }
-
-      // Sort by relevance
-      allResults.sort((a, b) => a.distance - b.distance);
-
-      const formatted = allResults
-        .slice(0, limit * targetStores.length)
-        .map((r, i) => {
-          const ref = r.heading
-            ? `${r.store}/${r.filePath} > ${r.heading}`
-            : `${r.store}/${r.filePath}`;
-          return `**${i + 1}. ${ref}** (lines ${r.startLine}-${r.endLine}, distance: ${r.distance.toFixed(4)})\n${r.content}`;
-        })
-        .join("\n\n---\n\n");
-
-      return {
-        content: [{ type: "text", text: formatted }],
-        details: { resultCount: allResults.length },
-      };
-    },
-  });
-
-  pi.registerTool({
-    name: "memory_read",
-    label: "Memory Read",
-    description: "Read a specific memory file verbatim.",
-    parameters: Type.Object({
-      path: Type.String({
-        description: "File path relative to the memory store",
-      }),
-      store: Type.Optional(
-        Type.String({
-          description: "Store name (default: first configured store)",
-        }),
-      ),
-    }),
-    async execute(toolCallId, params, signal, onUpdate, ctx) {
-      const path = params.path as string;
-      const storeName = (params.store as string) ?? getActiveStore(ctx);
-
-      if (!storeName || !stores.has(storeName)) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Store "${storeName}" not found. Available stores: ${Array.from(stores.keys()).join(", ")}`,
-            },
-          ],
-          details: {},
-          isError: true,
-        };
-      }
-
-      const state = stores.get(storeName)!;
-      const content = state.store.readFile(path);
-
-      if (content === null) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `File "${path}" not found in store "${storeName}". Available files:\n${state.store.listRelativeFiles().map((f) => `  - ${f}`).join("\n")}`,
-            },
-          ],
-          details: {},
-          isError: true,
-        };
-      }
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `## ${storeName}/${path}\n\n${content}`,
-          },
-        ],
-        details: { store: storeName, path, size: content.length },
-      };
-    },
-  });
-
-  pi.registerTool({
-    name: "memory_write",
-    label: "Memory Write",
-    description:
-      "Write or update a memory file. Use this to record decisions, patterns, or any information about the project.",
-    parameters: Type.Object({
-      path: Type.String({
-        description:
-          "File path relative to memory store (e.g. decisions.md, modules/auth.md)",
-      }),
-      content: Type.String({
-        description: "Markdown content to write",
-      }),
-      store: Type.Optional(
-        Type.String({
-          description: "Store name (default: first configured store)",
-        }),
-      ),
-    }),
-    async execute(toolCallId, params, signal, onUpdate, ctx) {
-      const path = params.path as string;
-      const content = params.content as string;
-      const storeName = (params.store as string) ?? getActiveStore(ctx);
-
-      if (!storeName || !stores.has(storeName)) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Store "${storeName}" not found. Available stores: ${Array.from(stores.keys()).join(", ")}`,
-            },
-          ],
-          details: {},
-          isError: true,
-        };
-      }
-
-      const state = stores.get(storeName)!;
-      state.store.writeFile(path, content);
-
-      // Re-index this file
-      await state.indexer.indexFiles([path]);
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Written to ${storeName}/${path} (${content.length} chars) and re-indexed.`,
-          },
-        ],
-        details: { store: storeName, path, size: content.length },
-      };
-    },
-  });
-
-  pi.registerTool({
-    name: "memory_refresh",
-    label: "Memory Refresh",
-    description:
-      "Force re-ingestion of the project state. Memory files are regenerated by analyzing the current codebase.",
-    parameters: Type.Object({}),
-    async execute(toolCallId, params, signal, onUpdate, ctx) {
-      if (!worker || stores.size === 0) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "No memory stores configured. Create a memory.config.json or .pi/memory.json file.",
-            },
-          ],
-          details: {},
-        };
-      }
-
-      // Run ingestion for all stores immediately
-      const results: string[] = [];
-      for (const [name] of stores) {
-        if (signal?.aborted) break;
-        await worker.runIngestion(name);
-        results.push(`${name}: ingested`);
-      }
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Memory refresh complete:\n${results.map((r) => `  - ${r}`).join("\n")}`,
-          },
-        ],
-        details: { results },
-      };
-    },
-  });
-
-  pi.registerTool({
-    name: "memory_status",
-    label: "Memory Status",
-    description:
-      "Show memory store status: stores loaded, file count, last updated, model info.",
-    parameters: Type.Object({}),
-    async execute(toolCallId, params, signal, onUpdate, ctx) {
-      if (stores.size === 0) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "No memory stores configured. Create a memory.config.json or .pi/memory.json file.",
-            },
-          ],
-          details: {},
-        };
-      }
-
-      const lines: string[] = [];
-      for (const [name, state] of stores) {
-        const files = state.store.listRelativeFiles();
-        const lastIngested = state.store.getLastIngestedAt();
-        const chunkCount = await state.indexer.chunkCount();
-
-        lines.push(`### ${name}`);
-        lines.push(`- Path: \`${state.config.path}\``);
-        lines.push(`- Memory files: ${files.length}`);
-        lines.push(`- Indexed chunks: ${chunkCount}`);
-        lines.push(
-          `- Last ingested: ${lastIngested ?? "never"}`,
-        );
-        const searchMode = state.embedder
-          ? `semantic (${state.config.embedding?.provider}/${state.config.embedding?.model})`
-          : "text (keyword)";
-        lines.push(`- Search mode: ${searchMode}`);
-        lines.push(
-          `- Ingestion model: ${state.config.ingestionModel ?? "active (default)"}`,
-        );
-
-        if (files.length > 0) {
-          lines.push("- Files:");
-          for (const f of files) {
-            lines.push(`  - \`${f}\``);
-          }
-        }
-        lines.push("");
-      }
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: lines.join("\n"),
-          },
-        ],
-        details: {
-          storeCount: stores.size,
-          storeNames: Array.from(stores.keys()),
-        },
-      };
-    },
-  });
-
-  // ─── Commands ──────────────────────────────────────────
-
-  pi.registerCommand("memory", {
-    description:
-      "Manage project memory. Subcommands: refresh, status, rebuild",
-    handler: async (args, ctx) => {
-      const parts = (args || "").trim().split(/\s+/);
-      const subcmd = parts[0] || "status";
-
-      switch (subcmd) {
-        case "refresh": {
-          if (!worker || stores.size === 0) {
-            ctx.ui.notify("No memory stores configured", "warning");
-            return;
-          }
-          ctx.ui.notify("Refreshing memory...", "info");
-          for (const [name] of stores) {
-            await worker.runIngestion(name);
-          }
-          ctx.ui.notify("Memory refresh complete", "info");
-          break;
-        }
-
-        case "status": {
-          if (stores.size === 0) {
-            ctx.ui.notify(
-              "No memory stores configured. Create memory.config.json or .pi/memory.json",
-              "warning",
-            );
-            return;
-          }
-
-          const lines: string[] = ["Project Memory Status", ""];
-          for (const [name, state] of stores) {
-            const files = state.store.listRelativeFiles();
-            const lastIngested = state.store.getLastIngestedAt();
-            lines.push(`  ${name}:`);
-            lines.push(`    Path: ${state.config.path}`);
-            lines.push(`    Files: ${files.length}`);
-            lines.push(`    Last ingested: ${lastIngested ?? "never"}`);
-            if (files.length > 0) {
-              lines.push(`    Files: ${files.join(", ")}`);
-            }
-            lines.push("");
-          }
-
-          ctx.ui.notify(lines.join("\n"), "info");
-          break;
-        }
-
-        case "rebuild": {
-          if (stores.size === 0) {
-            ctx.ui.notify("No memory stores configured", "warning");
-            return;
-          }
-          ctx.ui.notify("Rebuilding vector indexes...", "info");
-          for (const [, state] of stores) {
-            await state.indexer.reindex();
-          }
-          ctx.ui.notify("Vector indexes rebuilt", "info");
-          break;
-        }
-
-        default:
-          ctx.ui.notify(
-            `Unknown subcommand: ${subcmd}. Use: refresh, status, rebuild`,
-            "warning",
-          );
-      }
-    },
+    return { systemPrompt: event.systemPrompt + note };
   });
 }
 
 // ─── Utility ────────────────────────────────────────────
 
-function isSubstantivePrompt(prompt: string): boolean {
-  const trimmed = prompt.trim();
-  if (trimmed.length < 15) return false;
-
-  // Skip simple affirmations, commands, single words
-  const skipPatterns = [
-    /^y(es)?$/i,
-    /^ok(ay)?$/i,
-    /^no$/i,
-    /^\./,
-    /^\//,
-    /^[!?]/,
-    /^thanks?$/i,
-    /^done$/i,
-    /^continue$/i,
-    /^go( ahead)?$/i,
-  ];
-
-  for (const pattern of skipPatterns) {
-    if (pattern.test(trimmed)) return false;
-  }
-
-  return true;
+function isSubstantive(prompt: string): boolean {
+  const t = prompt.trim();
+  if (t.length < 15) return false;
+  return ![/^y(es)?$/i, /^ok(ay)?$/i, /^no$/i, /^\./, /^\//, /^[!?]/, /^thanks?$/i, /^done$/i, /^continue$/i, /^go( ahead)?$/i].some((p) => p.test(t));
 }
