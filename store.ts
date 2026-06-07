@@ -50,7 +50,7 @@ export class MemoryStore {
       this._db = new DatabaseSync(this.dbPath, { allowExtension: true });
       sqliteVec.load(this._db);
 
-      const dimensions = this.config.embedding?.dimensions ?? 768;
+      const dims = this.config.embedding?.dimensions ?? 768;
       this._db.exec(`
         CREATE TABLE IF NOT EXISTS chunks (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,10 +61,8 @@ export class MemoryStore {
           content TEXT NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS vec_chunks (
-          id INTEGER PRIMARY KEY REFERENCES chunks(id),
-          embedding FLOAT32(${dimensions})
-        );
+        -- vec0 virtual table is created lazily by MemoryIndexer when
+        -- an embedding provider is configured
 
         CREATE TABLE IF NOT EXISTS store_meta (
           key TEXT PRIMARY KEY,

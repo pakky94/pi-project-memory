@@ -29,14 +29,22 @@ function simpleHash(content: string): string {
 
 export class MemoryIndexer {
   private store: MemoryStore;
-  private embedder: BatchEmbedder;
+  private embedder: BatchEmbedder | null;
 
+  /**
+   * @param embedder - if null, semantic search is disabled;
+   *   `search()` falls back to basic text (LIKE) matching.
+   */
   constructor(
     store: MemoryStore,
-    embedder: BatchEmbedder,
+    embedder: BatchEmbedder | null,
   ) {
     this.store = store;
     this.embedder = embedder;
+  }
+
+  get hasSemanticSearch(): boolean {
+    return this.embedder !== null;
   }
 
   /**
@@ -91,18 +99,27 @@ export class MemoryIndexer {
     const db = this.store.getDb();
     if (!db) return;
 
-    // If full reindex, drop and recreate vec0
+    // If full reindex, drop and recreate vec0 (only if embedding is available)
     if (isFullReindex) {
-      try {
-        db.exec("DROP TABLE IF EXISTS vec0_index");
-      } catch {
-        // May not exist
-      }
+      if (this.embedder) {
+        try {
+          db.exec("DROP TABLE IF EXISTS vec0_index");
+        } catch {
+          // May not exist
+        }
 
-      const dimensions = this.embedder.dimensions;
-      db.exec(
-        `CREATE VIRTUAL TABLE vec0_index USING vec0(embedding FLOAT32(${dimensions}), chunk_id INTEGER)`,
-      );
+        const dimensions = this.embedder.dimensions;
+        db.exec(
+          `CREATE VIRTUAL TABLE vec0_index USING vec0(embedding FLOAT32(${dimensions}), chunk_id INTEGER)`,
+        );
+      } else {
+        // No embedding — ensure any stale vec0 table is cleaned up
+        try {
+          db.exec("DROP TABLE IF EXISTS vec0_index");
+        } catch {
+          // May not exist
+        }
+      }
     }
 
     // Chunk all files
@@ -125,48 +142,54 @@ export class MemoryIndexer {
 
     // Remove old chunks for the affected files (incremental update)
     if (removeOldFor && removeOldFor.length > 0) {
-      const removeStmt = db.prepare(
-        "DELETE FROM chunks WHERE file_path IN (" +
-          removeOldFor.map(() => "?").join(",") +
-          ")",
-      );
-      removeStmt.run(...removeOldFor);
+      const placeholders = removeOldFor.map(() => "?").join(",");
 
-      // Also remove from vec0 via chunk_id
-      for (const relPath of removeOldFor) {
-        const oldIds = db
-          .prepare("SELECT id FROM chunks WHERE file_path = ?")
-          .all(relPath) as { id: number }[];
-        for (const { id } of oldIds) {
-          try {
-            db.prepare("DELETE FROM vec0_index WHERE chunk_id = ?").run(
-              BigInt(id),
-            );
-          } catch {
-            // Row may not exist
+      if (this.embedder) {
+        // Also remove from vec0 via chunk_id
+        for (const relPath of removeOldFor) {
+          const oldIds = db
+            .prepare("SELECT id FROM chunks WHERE file_path = ?")
+            .all(relPath) as { id: number }[];
+          for (const { id } of oldIds) {
+            try {
+              db.prepare("DELETE FROM vec0_index WHERE chunk_id = ?").run(
+                BigInt(id),
+              );
+            } catch {
+              // Row may not exist
+            }
           }
         }
       }
+
+      const removeStmt = db.prepare(
+        `DELETE FROM chunks WHERE file_path IN (${placeholders})`,
+      );
+      removeStmt.run(...removeOldFor);
     }
 
-    // Prepare insert statements
+    // Prepare insert statement for chunks
     const chunkIns = db.prepare(
       "INSERT INTO chunks (file_path, heading, start_line, end_line, content) VALUES (?, ?, ?, ?, ?)",
     );
-    const vecIns = db.prepare(
-      "INSERT INTO vec0_index(chunk_id, embedding) VALUES(CAST(? AS INTEGER), ?)",
-    );
 
-    // Embed in batches
-    const texts = allChunks.map((c) => c.content);
-    const embeddings = await this.embedder.embedAll(texts);
+    let embeddings: number[][] | null = null;
+    let vecIns: ReturnType<typeof db.prepare> | null = null;
 
-    // Insert chunks and vectors in a transaction
+    if (this.embedder) {
+      vecIns = db.prepare(
+        "INSERT INTO vec0_index(chunk_id, embedding) VALUES(CAST(? AS INTEGER), ?)",
+      );
+      // Embed in batches
+      const texts = allChunks.map((c) => c.content);
+      embeddings = await this.embedder.embedAll(texts);
+    }
+
+    // Insert chunks (and optionally vectors) in a transaction
     db.exec("BEGIN");
     try {
       for (let i = 0; i < allChunks.length; i++) {
         const chunk = allChunks[i];
-        const embedding = embeddings[i];
 
         chunkIns.run(
           chunk.filePath,
@@ -176,16 +199,16 @@ export class MemoryIndexer {
           chunk.content,
         );
 
-        // Get the last inserted rowid
-        const lastId = (
-          db.prepare("SELECT last_insert_rowid() as id").get() as {
-            id: number;
-          }
-        ).id;
+        if (vecIns && embeddings) {
+          const lastId = (
+            db.prepare("SELECT last_insert_rowid() as id").get() as {
+              id: number;
+            }
+          ).id;
 
-        // Insert into vec0 (use BigInt for the chunk_id)
-        const buf = Buffer.from(new Float32Array(embedding).buffer);
-        vecIns.run(BigInt(lastId), buf);
+          const buf = Buffer.from(new Float32Array(embeddings[i]).buffer);
+          vecIns.run(BigInt(lastId), buf);
+        }
       }
       db.exec("COMMIT");
     } catch (err) {
@@ -195,7 +218,10 @@ export class MemoryIndexer {
   }
 
   /**
-   * Semantic search: embed query, KNN search across vec0_index, join with chunks.
+   * Search across memory chunks.
+   *
+   * If an embedder is configured, runs semantic (vector) search.
+   * Otherwise falls back to basic text matching with LIKE.
    */
   async search(
     query: string,
@@ -204,13 +230,26 @@ export class MemoryIndexer {
     const db = this.store.getDb();
     if (!db) return [];
 
-    // Embed the query
-    const [queryVec] = await this.embedder.embedAll([query]);
+    if (this.embedder) {
+      return this._semanticSearch(db, query, limit);
+    }
+
+    return this._textSearch(db, query, limit);
+  }
+
+  /**
+   * Semantic (vector) KNN search.
+   */
+  private async _semanticSearch(
+    db: ReturnType<typeof this.store.getDb>,
+    query: string,
+    limit: number,
+  ): Promise<SearchResult[]> {
+    const [queryVec] = await this.embedder!.embedAll([query]);
     if (!queryVec || queryVec.length === 0) return [];
 
     const queryBuf = Buffer.from(new Float32Array(queryVec).buffer);
 
-    // KNN search using vec0's k-NN constraint
     const results = db
       .prepare(
         `SELECT
@@ -242,6 +281,68 @@ export class MemoryIndexer {
       endLine: r.end_line,
       content: r.content,
       distance: r.distance,
+    }));
+  }
+
+  /**
+   * Text-based fallback search using LIKE.
+   * Splits the query into words and matches any word in content or heading.
+   */
+  private _textSearch(
+    db: ReturnType<typeof this.store.getDb>,
+    query: string,
+    limit: number,
+  ): SearchResult[] {
+    const words = query
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((w) => w.length > 1);
+
+    if (words.length === 0) {
+      // Return most recent chunks
+      const rows = db
+        .prepare(
+          `SELECT file_path, heading, start_line, end_line, content
+           FROM chunks ORDER BY id DESC LIMIT ?`,
+        )
+        .all(limit) as any[];
+      return rows.map((r) => ({
+        store: this.store.name,
+        filePath: r.file_path,
+        heading: r.heading,
+        startLine: r.start_line,
+        endLine: r.end_line,
+        content: r.content,
+        distance: 0,
+      }));
+    }
+
+    // Build WHERE clause matching any word in content or heading
+    const conditions = words.map(
+      () => "(c.content LIKE ? OR c.heading LIKE ?)",
+    );
+    const params: string[] = [];
+    for (const word of words) {
+      params.push(`%${word}%`, `%${word}%`);
+    }
+
+    const sql = `
+      SELECT c.file_path, c.heading, c.start_line, c.end_line, c.content
+      FROM chunks c
+      WHERE ${conditions.join(" OR ")}
+      ORDER BY c.id DESC
+      LIMIT ?
+    `;
+
+    const rows = db.prepare(sql).all(...params, limit) as any[];
+    return rows.map((r) => ({
+      store: this.store.name,
+      filePath: r.file_path,
+      heading: r.heading,
+      startLine: r.start_line,
+      endLine: r.end_line,
+      content: r.content,
+      distance: 0,
     }));
   }
 

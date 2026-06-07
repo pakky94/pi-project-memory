@@ -125,20 +125,8 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      // Use a mock embedder if no real one configured (allows index to exist for testing)
-      const be =
-        embedder ??
-        new BatchEmbedder(
-          {
-            embed: async (texts) =>
-              texts.map(() => new Array(4).fill(0)),
-            dimensions: 4,
-          },
-          20,
-          1,
-        );
-
-      const indexer = new MemoryIndexer(store, be);
+      // If no embedding configured, indexer falls back to text search
+      const indexer = new MemoryIndexer(store, embedder);
 
       stores.set(cfg.name, { store, indexer, embedder, config: cfg });
     }
@@ -238,9 +226,11 @@ export default function (pi: ExtensionAPI) {
       try {
         const allResults: SearchResult[] = [];
         for (const [, state] of stores) {
-          if (state.embedder) {
+          try {
             const results = await state.indexer.search(event.prompt, 3);
             allResults.push(...results);
+          } catch {
+            // Best-effort — one store failing shouldn't block others
           }
         }
 
@@ -309,7 +299,7 @@ export default function (pi: ExtensionAPI) {
 
       for (const name of targetStores) {
         const state = stores.get(name);
-        if (!state?.embedder) continue;
+        if (!state) continue;
 
         const results = await state.indexer.search(query, limit);
         allResults.push(...results);
@@ -446,10 +436,8 @@ export default function (pi: ExtensionAPI) {
       const state = stores.get(storeName)!;
       state.store.writeFile(path, content);
 
-      // Re-index just this file
-      if (state.embedder) {
-        await state.indexer.indexFiles([path]);
-      }
+      // Re-index this file
+      await state.indexer.indexFiles([path]);
 
       return {
         content: [
@@ -534,9 +522,10 @@ export default function (pi: ExtensionAPI) {
         lines.push(
           `- Last ingested: ${lastIngested ?? "never"}`,
         );
-        lines.push(
-          `- Embedding: ${state.config.embedding ? `${state.config.embedding.provider}/${state.config.embedding.model}` : "none (no semantic search)"}`,
-        );
+        const searchMode = state.embedder
+          ? `semantic (${state.config.embedding?.provider}/${state.config.embedding?.model})`
+          : "text (keyword)";
+        lines.push(`- Search mode: ${searchMode}`);
         lines.push(
           `- Ingestion model: ${state.config.ingestionModel ?? "active (default)"}`,
         );
@@ -622,9 +611,7 @@ export default function (pi: ExtensionAPI) {
           }
           ctx.ui.notify("Rebuilding vector indexes...", "info");
           for (const [, state] of stores) {
-            if (state.embedder) {
-              await state.indexer.reindex();
-            }
+            await state.indexer.reindex();
           }
           ctx.ui.notify("Vector indexes rebuilt", "info");
           break;
