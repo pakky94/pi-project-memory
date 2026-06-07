@@ -1,0 +1,16 @@
+{
+  "name": "pi-project-memory",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {
+    "sqlite-vec": "^0.1.8",
+    "minimatch": "^10.0.1"
+  },
+  "devDependencies": {
+    "@types/minimatch": "^5.1.2"
+  }
+}
